@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ────── CONFIG ──────
-RAID_MOUNT="/mnt/data"        # Change this if your RAID mount is different
-RAID_DEVICE="/dev/md127"        # Your mdadm RAID device
+DATA_MOUNT="/home"      # Mount point for /home data (formerly /home/cloud/data in example output)
+STORAGE_MOUNT="/mnt/storage" # Mount point for /mnt/storage
 
 # ────── COLORS ──────
 RED="\e[31m"
@@ -57,8 +57,9 @@ format_bytes() {
 }
 
 draw_disk_bar_bytes() {
-  local used=$1
-  local total=$2
+  local label=$1 # New: label parameter for "data:", "storage:", etc.
+  local used=$2
+  local total=$3
   local bar_length=30
   local percent=$(awk "BEGIN {printf \"%.0f\", ($used / $total) * 100}")
   local filled=$(( bar_length * percent / 100 ))
@@ -66,7 +67,7 @@ draw_disk_bar_bytes() {
   local bar=$(printf "%0.s█" $(seq 1 $filled))
   local space=$(printf "%0.s░" $(seq 1 $empty))
   color_for_percent "$percent"
-  echo -e " [${bar}${space}] $(format_bytes $used)/$(format_bytes $total) (${percent}%)${RESET}"
+  echo -e "${label} [${bar}${space}] $(format_bytes $used)/$(format_bytes $total) (${percent}%)${RESET}"
 }
 
 # ────── SYSTEM INFO ──────
@@ -75,59 +76,64 @@ echo -e "${BOLD}${CYAN}OS:${RESET} $(grep PRETTY_NAME /etc/os-release | cut -d= 
 echo -e "${BOLD}${CYAN}IP address (local):${RESET} $(hostname -I | awk '{print $1}')"
 echo -e "${BOLD}${CYAN}Public IP address:${RESET} $(curl -s ifconfig.me)"
 echo -e "${BOLD}${CYAN}Uptime:${RESET} $(uptime -p)"
-echo -e "${BOLD}${CYAN}Load average:${RESET} $(uptime | awk -F'load average: ' '{ print $2 }')"
 
 # ────── MEMORY ──────
 read -r _ total used _ _ <<< $(free -m | awk '/^Mem:/ {print $1, $2, $3, $6, $7}')
-echo -e "\n${BOLD}${YELLOW}Memory:${RESET}"
+echo -e "\n${BOLD}${CYAN}Memory:${RESET}"
 draw_bar "$used" "$total"
 
-# ────── RAID DISK ──────
-echo -e "\n${BOLD}${YELLOW}Disk (${RAID_MOUNT}):${RESET}"
-if mountpoint -q "$RAID_MOUNT"; then
-  read -r size used <<< $(df -B1 "$RAID_MOUNT" | awk 'NR==2 {print $2, $3}')
-  draw_disk_bar_bytes "$used" "$size"
+# ────── STORAGE USAGE ──────
+echo -e "\n${BOLD}${CYAN}Storage:${RESET}" # Single "Storage" title
+
+# /home disk usage (labeled "data:")
+if mountpoint -q "$DATA_MOUNT"; then
+  read -r size used <<< $(df -B1 "$DATA_MOUNT" | awk 'NR==2 {print $2, $3}')
+  draw_disk_bar_bytes "data:" "$used" "$size" # Label "data:"
 else
-  echo -e "${RED}RAID mount point not found or not mounted!${RESET}"
+  echo -e "${RED}data (${DATA_MOUNT}) not found or not mounted!${RESET}"
 fi
 
-# ────── IPMI TEMPERATURES ──────
-echo -e "\n${BOLD}${YELLOW}Hardware Health (IPMI):${RESET}"
-if command -v ipmitool &> /dev/null; then
-  sudo ipmitool sdr | grep -E 'Temp|FAN|CPU' | grep -v 'no reading' | while read -r line; do
-    name=$(echo "$line" | awk -F'|' '{print $1}' | xargs)
-    value=$(echo "$line" | awk -F'|' '{print $2}' | xargs)
-    status=$(echo "$line" | awk -F'|' '{print $3}' | xargs)
+# /mnt/storage disk usage (labeled "storage:")
+if mountpoint -q "$STORAGE_MOUNT"; then
+  read -r size used <<< $(df -B1 "$STORAGE_MOUNT" | awk 'NR==2 {print $2, $3}')
+  draw_disk_bar_bytes "storage:" "$used" "$size" # Label "storage:"
+else
+  echo -e "${RED}storage (${STORAGE_MOUNT}) not found or not mounted!${RESET}"
+fi
 
-    if [[ $value == *degrees* ]]; then
-      temp=$(echo "$value" | grep -oE '[0-9]+')
-      if [ "$temp" -ge 80 ]; then
-        color=$RED
-      elif [ "$temp" -ge 60 ]; then
-        color=$YELLOW
-      else
-        color=$GREEN
-      fi
-      echo -e "${color}${name}: ${value} (${status})${RESET}"
-    elif [[ $value == *RPM* ]]; then
-      echo -e "${CYAN}${name}: ${value} (${status})${RESET}"
+
+# ────── TEMPERATURES ──────
+echo -e "\n${BOLD}${CYAN}Temperatures:${RESET}"
+if command -v sensors &> /dev/null; then
+  sensors | grep -E 'Core|Package|temp[0-9]:' | while read -r line; do
+    label=$(echo "$line" | cut -d':' -f1 | xargs)
+
+    # Rename temp labels
+    case "$label" in
+      temp1) label="SYSTEM" ;;
+      temp2) label="CPU" ;;
+    esac
+
+    temp=$(echo "$line" | grep -oE '[+-]?[0-9]+(\.[0-9]+)?°C' | tr -d '+°C')
+
+    # Validate temperature value
+    if [[ -z "$temp" ]] || ! [[ "$temp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+      continue # Skip if temp is empty or not a valid number
     fi
+    if echo "$temp < -50" | bc -l | grep -q 1; then
+      continue # Skip unrealistically low temperatures
+    fi
+
+    # Color logic for temperatures
+    color=$GREEN
+    if echo "$temp >= 80" | bc -l | grep -q 1; then
+      color=$RED
+    elif echo "$temp >= 60" | bc -l | grep -q 1; then
+      color=$YELLOW
+    fi
+
+    echo -e "${color}${label}: ${temp}°C${RESET}"
   done
 else
-  echo -e "${RED}ipmitool not installed or not configured.${RESET}"
+  echo -e "${RED}lm_sensors not installed or not configured.${RESET}"
 fi
-
-# ────── RAID HEALTH ──────
-echo -e "\n${BOLD}${YELLOW}RAID Health (${RAID_DEVICE}):${RESET}"
-if [ -e "$RAID_DEVICE" ]; then
-  mdadm --detail "$RAID_DEVICE" | grep -E 'State :|Active Devices|Working Devices|Failed Devices'
-else
-  echo -e "${RED}RAID device ${RAID_DEVICE} not found.${RESET}"
-fi
-
-# ────── SERVICES ──────
-echo -e "\n${BOLD}${YELLOW}Services:${RESET}"
-for svc in docker cockpit.service sshd mdadm firwalld; do
-    systemctl is-active --quiet "$svc" && echo -e "${GREEN}▲ $svc${RESET}"
-done
-echo ""
