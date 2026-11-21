@@ -555,7 +555,11 @@ get_drive_health() {
   fi
 
   # Fallback for USB bridges where smartctl -H is limited.
-  bad=$(sudo smartctl -A $args "$dev" 2>/dev/null | awk '
+  # No SMART attributes at all (no sudo, unsupported device) means unknown, not OK.
+  local attrs
+  attrs=$(sudo smartctl -A $args "$dev" 2>/dev/null)
+  [ -z "$attrs" ] && { echo "UNKNOWN"; return; }
+  bad=$(echo "$attrs" | awk '
     /Reallocated_Sector_Ct/   && $10 > 0 {bad=1}
     /Current_Pending_Sector/  && $10 > 0 {bad=1}
     /Offline_Uncorrectable/   && $10 > 0 {bad=1}
@@ -570,7 +574,8 @@ get_drive_health() {
   echo "${bad:-UNKNOWN}"
 }
 
-if [ "$HAS_SMARTCTL" -eq 1 ]; then
+# The drive list comes from lsblk, so it works without smartctl (SMART columns then show n/a)
+if command -v lsblk &>/dev/null; then
   JMB_BASE_DEV=""
   JMB_SLOT=0
 
@@ -583,7 +588,7 @@ if [ "$HAS_SMARTCTL" -eq 1 ]; then
     [[ "$NAME" == loop* || "$NAME" == ram* ]] && continue
 
     candidate="/dev/$NAME"
-    if sudo smartctl -i -d jmb39x-q,0 "$candidate" &>/dev/null; then
+    if [ "$HAS_SMARTCTL" -eq 1 ] && sudo smartctl -i -d jmb39x-q,0 "$candidate" &>/dev/null; then
       JMB_BASE_DEV="$candidate"
       break
     fi
@@ -605,14 +610,18 @@ if [ "$HAS_SMARTCTL" -eq 1 ]; then
       JMB_SLOT=$(( JMB_SLOT + 1 ))
     fi
 
-    access=$(get_smart_access_for_drive "$dev" "$TRAN" "$JMB_BASE_DEV" "${jmb_slot_for_drive:-0}")
-    smart_dev="${access%%|*}"
-    args="${access#*|}"
+    smart_dev=""; args=""
+    if [ "$HAS_SMARTCTL" -eq 1 ]; then
+      access=$(get_smart_access_for_drive "$dev" "$TRAN" "$JMB_BASE_DEV" "${jmb_slot_for_drive:-0}")
+      smart_dev="${access%%|*}"
+      args="${access#*|}"
+    fi
 
     drv_model="$MODEL"
     drv_size="$SIZE"
     drv_temp="n/a"
     drv_status="UNKNOWN"
+    [ "$HAS_SMARTCTL" -eq 0 ] && drv_status="n/a"
 
     if [[ -n "$smart_dev" ]]; then
       smart_info=$(sudo smartctl -i $args "$smart_dev" 2>/dev/null)
@@ -701,6 +710,8 @@ if command -v dmidecode &>/dev/null; then
   else
     RAM_NOTE="n/a (dmidecode needs sudo)"
   fi
+else
+  RAM_NOTE="n/a (dmidecode not installed)"
 fi
 
 # ── Collect: Hardware Health ──────────────────────────────
@@ -801,6 +812,32 @@ if [ "${#HW_NAME[@]}" -eq 0 ]; then
     HW_VALUE+=("$(awk -v t="$_tzraw" 'BEGIN {printf "%.1f", t/1000}')°C")
     HW_STATUS+=("ok"); HW_TYPE+=("temp")
   done
+
+  # CPU chips that only appear in hwmon (no thermal zone): prefer package/Tctl/Tdie, else hottest core
+  if [ -z "${_SEEN_TZ[CPU Temp]}" ]; then
+    for _hw in /sys/class/hwmon/hwmon*; do
+      case "$(cat "$_hw/name" 2>/dev/null)" in
+        coretemp|k10temp|zenpower|cpu_thermal) ;;
+        *) continue ;;
+      esac
+      _best=""; _max=""
+      for _t in "$_hw"/temp*_input; do
+        [ -r "$_t" ] || continue
+        _v=$(cat "$_t" 2>/dev/null); [[ "$_v" =~ ^[0-9]+$ ]] || continue
+        [ "$_v" -gt 0 ] && [ "$_v" -le 150000 ] || continue
+        _lbl=$(cat "${_t%_input}_label" 2>/dev/null)
+        case "$_lbl" in "Package id"*|Tctl|Tdie) [ -z "$_best" ] && _best="$_v" ;; esac
+        { [ -z "$_max" ] || [ "$_v" -gt "$_max" ]; } && _max="$_v"
+      done
+      _cpu_raw="${_best:-$_max}"
+      if [ -n "$_cpu_raw" ]; then
+        HW_NAME+=("CPU Temp")
+        HW_VALUE+=("$(awk -v t="$_cpu_raw" 'BEGIN {printf "%.1f", t/1000}')°C")
+        HW_STATUS+=("ok"); HW_TYPE+=("temp")
+        break
+      fi
+    done
+  fi
 fi
 
 # ── Render ────────────────────────────────────────────────
@@ -906,7 +943,7 @@ else
   for i in "${!DRV_DEV[@]}"; do
     drive_row "${DRV_DEV[$i]}" "${DRV_MODEL[$i]}" "${DRV_SIZE[$i]}" "${DRV_TEMP[$i]}" "${DRV_STATUS[$i]}"
   done
-  [ "$HAS_SMARTCTL" -eq 0 ] && kv_row "⚠ install smartctl" "dnf install smartmontools" "$YELLOW" "$DIM"
+  [ "$HAS_SMARTCTL" -eq 0 ] && kv_row "⚠ smartctl missing" "install smartmontools for temp/health" "$YELLOW" "$DIM"
 fi
 
 if [ "${#RAID_DEV[@]}" -gt 0 ]; then
