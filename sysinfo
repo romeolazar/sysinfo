@@ -1,0 +1,707 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════
+#  sysinfo — universal system overview
+#  Works on: servers with IPMI, NUCs, desktops, VMs
+#  Auto-detects: ipmitool, lm_sensors, mpstat, mdadm, smartctl
+# ══════════════════════════════════════════════════════════
+
+# ── Colors ────────────────────────────────────────────────
+RED="\e[38;5;203m"
+GREEN="\e[38;5;114m"
+YELLOW="\e[38;5;221m"
+CYAN="\e[38;5;81m"
+BLUE="\e[38;5;69m"
+MAGENTA="\e[38;5;183m"
+DIM="\e[2m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+TL="╭"; TR="╮"; BL="╰"; BR="╯"; H="─"; V="│"; ML="├"; MR="┤"
+
+# ── Layout ────────────────────────────────────────────────
+W=70; K=18; VL=$(( W - K - 7 )); INNER=$(( W - 2 ))
+
+# ── Primitives ────────────────────────────────────────────
+rep() { local i; for ((i=0; i<$2; i++)); do printf "%s" "$1"; done; }
+
+color_pct() {
+  local p=$1
+  if   [ "$p" -ge 90 ]; then printf "%s" "$RED"
+  elif [ "$p" -ge 75 ]; then printf "%s" "$YELLOW"
+  else                        printf "%s" "$GREEN"
+  fi
+}
+
+temp_color() {
+  local t=$1
+  if   [ "$t" -ge 90 ]; then printf "%s" "$RED"
+  elif [ "$t" -ge 75 ]; then printf "%s" "$YELLOW"
+  else                        printf "%s" "$GREEN"
+  fi
+}
+
+fmt_bytes() {
+  local b=$1
+  if   [ "$b" -ge 1099511627776 ]; then awk "BEGIN {printf \"%.2fT\", $b/1099511627776}"
+  elif [ "$b" -ge 1073741824    ]; then awk "BEGIN {printf \"%.2fG\", $b/1073741824}"
+  elif [ "$b" -ge 1048576       ]; then awk "BEGIN {printf \"%.1fM\", $b/1048576}"
+  else printf "%dB" "$b"
+  fi
+}
+
+# ── Box drawing ───────────────────────────────────────────
+top_line()    { printf "${DIM}${TL}"; rep "$H" "$INNER"; printf "${TR}${RESET}\n"; }
+bottom_line() { printf "${DIM}${BL}"; rep "$H" "$INNER"; printf "${BR}${RESET}\n"; }
+
+section() {
+  local label="$1" ll=${#1}
+  local dashes=$(( INNER - ll - 2 ))
+  local l=$(( dashes / 2 )) r=$(( dashes - dashes / 2 ))
+  printf "${DIM}${ML}"; rep "$H" "$l"
+  printf "${RESET} ${BOLD}${CYAN}%s${RESET} ${DIM}" "$label"
+  rep "$H" "$r"; printf "${MR}${RESET}\n"
+}
+
+title_row() {
+  local text="$1" rpad=$(( INNER - ${#1} - 1 ))
+  printf "${DIM}${V}${RESET} ${BOLD}${CYAN}%s${RESET}" "$text"
+  rep " " "$rpad"; printf "${DIM}${V}${RESET}\n"
+}
+
+_row() {
+  local key="$1" val="$2" kc="$3" vc="$4"
+  local kpad=$(( K  - ${#key} )); [ "$kpad" -lt 0 ] && kpad=0
+  local vpad=$(( VL - ${#val} )); [ "$vpad" -lt 0 ] && vpad=0
+  printf "${DIM}${V}${RESET} ${kc}${BOLD}%s${RESET}" "$key"; rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} ${vc}%s${RESET}"        "$val"; rep " " "$vpad"
+  printf " ${DIM}${V}${RESET}\n"
+}
+kv_row() { _row "$1" "$2" "${3:-$CYAN}" "${4:-$RESET}"; }
+
+# dot_meter FILL EMPTY — prints exactly FILL+EMPTY visible chars, no string stored
+dot_meter() {
+  local fill=$1 empty=$2 c=$3
+  printf "${c}";   for ((i=0;i<fill; i++)); do printf "▪"; done
+  printf "${DIM}"; for ((i=0;i<empty;i++)); do printf "▫"; done
+  printf "${RESET}"
+}
+
+# temp_meter PCT — 8-char wide mini bar for temperatures (max=100°C)
+temp_meter() {
+  local t=$1 TDOTS=8
+  # clamp to 100
+  [ "$t" -gt 100 ] && t=100
+  local fill=$(( TDOTS * t / 100 ))
+  local empty=$(( TDOTS - fill ))
+  local c; c=$(temp_color "$t")
+  printf "${c}";   for ((i=0;i<fill; i++)); do printf "▪"; done
+  printf "${DIM}"; for ((i=0;i<empty;i++)); do printf "▫"; done
+  printf "${RESET}"
+}
+
+res_row() {
+  local key="$1" pct="$2" frac="$3"
+  local DOTS=10
+  local fill=$(( DOTS * pct / 100 ))
+  [ "$pct" -gt 0 ] && [ "$fill" -eq 0 ] && fill=1
+  [ "$fill" -gt "$DOTS" ] && fill="$DOTS"
+  local empty=$(( DOTS - fill ))
+  local c; c=$(color_pct "$pct")
+  local pct_tag="${pct}%"
+
+  # Fixed value-side layout for System Resources and Storage.
+  # meter(10) + space + pct(5, supports 100%) + two spaces + value(rest)
+  local pct_w=5
+  local fixed=$(( DOTS + 1 + pct_w + 2 ))
+  local frac_w=$(( VL - fixed ))
+  [ "$frac_w" -lt 0 ] && frac_w=0
+
+  local kpad=$(( K - ${#key} )); [ "$kpad" -lt 0 ] && kpad=0
+
+  printf "${DIM}${V}${RESET} ${CYAN}${BOLD}%s${RESET}" "$key"
+  rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} "
+
+  dot_meter "$fill" "$empty" "$c"
+  printf " "
+  printf "${c}${BOLD}%-${pct_w}s${RESET}" "$pct_tag"
+  printf "  ${DIM}%-${frac_w}.${frac_w}s${RESET}" "$frac"
+
+  printf " ${DIM}${V}${RESET}\n"
+}
+
+# hw_row — key | [meter] value  [status]
+# type: "temp" adds 8-dot temp meter; "fan" is plain; default is plain
+hw_row() {
+  local key="$1" value="$2" status="$3" vc="${4:-$GREEN}" type="${5:-plain}"
+  local stag="[${status}]"
+  local kpad=$(( K - ${#key} )); [ "$kpad" -lt 0 ] && kpad=0
+  printf "${DIM}${V}${RESET} ${CYAN}%s${RESET}" "$key"; rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} "
+  if [ "$type" = "temp" ]; then
+    local tnum; tnum=$(echo "$value" | grep -oE '^-?[0-9]+')
+    local tint=${tnum%.*}
+    temp_meter "${tint:-0}"
+    printf " "
+    # visible length of value: °C is 2 visible chars but 3 bytes — strip it, measure, add 2
+    local val_vis; val_vis=$(printf '%s' "$value" | sed 's/°C/XX/' | awk '{print length($0)}')
+    local stag_len=${#stag}
+    local vpad=$(( VL - 8 - 1 - val_vis - 2 - stag_len )); [ "$vpad" -lt 0 ] && vpad=0
+    printf "${vc}${BOLD}%s${RESET}  ${vc}%s${RESET}" "$value" "$stag"
+    rep " " "$vpad"
+  else
+    # fan / plain: value is pure ASCII, ${#value} is safe
+    local vpad=$(( VL - ${#value} - 2 - ${#stag} )); [ "$vpad" -lt 0 ] && vpad=0
+    printf "${vc}${BOLD}%s${RESET}  ${DIM}%s${RESET}" "$value" "$stag"
+    rep " " "$vpad"
+  fi
+  printf " ${DIM}${V}${RESET}
+"
+}
+
+# Drive table layout.
+# Left/key column shows Drive. Value area shows Model + Size + Temp + Status.
+# Model + Size + Temp + Status = 22+1+7+1+6+1+7 = 45 visible chars = VL.
+DRV_M=22
+DRV_S=7
+DRV_T=6
+DRV_ST=7
+
+_drv_val() {
+  local model="$1" size="$2" temp="$3" status="$4"
+  [ "${#model}" -gt "$DRV_M" ] && model="${model:0:$(( DRV_M - 1 ))}~"
+  local mp=$(( DRV_M  - ${#model}  )); [ "$mp"  -lt 0 ] && mp=0
+  local sp=$(( DRV_S  - ${#size}   )); [ "$sp"  -lt 0 ] && sp=0
+  local tp=$(( DRV_T  - ${#temp}   )); [ "$tp"  -lt 0 ] && tp=0
+  local stp=$(( DRV_ST - ${#status} )); [ "$stp" -lt 0 ] && stp=0
+
+  local sc
+  case "$status" in
+    OK)      sc="$GREEN"  ;;
+    WARNING) sc="$YELLOW" ;;
+    FAILED)  sc="$RED"    ;;
+    *)       sc="$DIM"    ;;
+  esac
+
+  local tc="$RESET"
+  [[ "$temp" =~ ^([0-9]+) ]] && tc=$(temp_color "${BASH_REMATCH[1]}")
+
+  printf "%s" "$model";                       rep " " "$mp"
+  printf " ${DIM}%s${RESET}" "$size";         rep " " "$sp"
+  printf " ${tc}%s${RESET}" "$temp";          rep " " "$tp"
+  printf " ${sc}${BOLD}%s${RESET}" "$status"; rep " " "$stp"
+}
+
+drive_header() {
+  local kpad=$(( K - 5 )); [ "$kpad" -lt 0 ] && kpad=0
+  printf "${DIM}${V}${RESET} ${DIM}${BOLD}%-5s${RESET}" "Drive"; rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} "; _drv_val "Model" "Size" "Temp" "Status"
+  printf " ${DIM}${V}${RESET}\n"
+}
+
+drive_row() {
+  local dev="$1" model="$2" size="$3" temp="$4" status="$5"
+  local dd="$dev"
+
+  [ "${#dd}" -gt "$K" ] && dd="${dd:0:$(( K - 1 ))}~"
+
+  local kpad=$(( K - ${#dd} )); [ "$kpad" -lt 0 ] && kpad=0
+
+  printf "${DIM}${V}${RESET} ${CYAN}${BOLD}%s${RESET}" "$dd"
+  rep " " "$kpad"
+
+  printf " ${DIM}${V}${RESET} "
+  _drv_val "$model" "$size" "$temp" "$status"
+
+  printf " ${DIM}${V}${RESET}\n"
+}
+
+proc_row() {
+  local name="$1" pid="$2" cpu="$3" mem="$4"
+  local DOTS=10
+  local cpu_int=${cpu%.*}
+  local fill=$(( DOTS * cpu_int / 100 ))
+  [ "$cpu_int" -gt 0 ] && [ "$fill" -eq 0 ] && fill=1
+  [ "$fill" -gt "$DOTS" ] && fill="$DOTS"
+  local empty=$(( DOTS - fill ))
+  local c; c=$(color_pct "$cpu_int")
+
+  local cpu_tag="${cpu}%"
+  local mem_tag="${mem}%"
+
+  # Fixed value-side layout for Top CPU Processes.
+  # meter(10) + space + CPU%(7, supports 100.0%) + PID(9) + MEM%(6, supports 100%)
+  local cpu_w=7
+  local pid_w=9
+  local mem_w=6
+  local fixed=$(( DOTS + 1 + cpu_w + pid_w + mem_w ))
+  local vpad=$(( VL - fixed ))
+  [ "$vpad" -lt 0 ] && vpad=0
+
+  [ "${#name}" -gt "$K" ] && name="${name:0:$(( K - 1 ))}~"
+  local kpad=$(( K - ${#name} ))
+  [ "$kpad" -lt 0 ] && kpad=0
+
+  printf "${DIM}${V}${RESET} ${CYAN}${BOLD}%s${RESET}" "$name"
+  rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} "
+
+  dot_meter "$fill" "$empty" "$c"
+  printf " "
+  printf "${c}${BOLD}%-${cpu_w}s${RESET}" "$cpu_tag"
+  printf "${DIM}%-${pid_w}s${RESET}" "$pid"
+  printf "${DIM}%-${mem_w}s${RESET}" "$mem_tag"
+  rep " " "$vpad"
+
+  printf " ${DIM}${V}${RESET}\n"
+}
+
+# ── Capability detection ──────────────────────────────────
+HAS_IPMITOOL=0; command -v ipmitool  &>/dev/null && HAS_IPMITOOL=1
+HAS_SENSORS=0;  command -v sensors   &>/dev/null && HAS_SENSORS=1
+HAS_MPSTAT=0;   command -v mpstat    &>/dev/null && HAS_MPSTAT=1
+HAS_MDADM=0;    command -v mdadm     &>/dev/null && HAS_MDADM=1
+HAS_SMARTCTL=0; command -v smartctl  &>/dev/null && HAS_SMARTCTL=1
+
+# ── Collect: Identity ─────────────────────────────────────
+OS_NAME=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')
+CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2- | xargs)
+CPU_CORES=$(nproc)
+
+LOCAL_IPS=()
+while read -r iface addr; do
+  [[ "$iface" =~ ^(lo|docker|br-|veth|virbr|tun|tap|dummy|ovs|flannel|cali|weave|cilium|wg|utun) ]] && continue
+  [[ "$iface" =~ \.[0-9]+$ ]] && continue
+  [[ "$(cat /sys/class/net/${iface}/operstate 2>/dev/null)" == "down" ]] && continue
+  LOCAL_IPS+=("${addr}(${iface})")
+done < <(ip -4 addr show | awk '/^[0-9]+:/{iface=$2; gsub(/:$/,"",iface)} /inet /{print iface, $2}' | awk -F'/' '{print $1}')
+
+PUBLIC_IP=$(curl -s --max-time 4 ifconfig.me 2>/dev/null || echo "n/a")
+
+UPTIME_STR=$(uptime -p | sed 's/^up //')
+UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime)
+UPTIME_DAYS=$(( UPTIME_SECS / 86400 ))
+if   [ "$UPTIME_DAYS" -ge 90 ]; then UPTIME_COLOR="$RED"
+elif [ "$UPTIME_DAYS" -ge 30 ]; then UPTIME_COLOR="$YELLOW"
+else                                  UPTIME_COLOR="$GREEN"
+fi
+
+LAST_LOGIN_RAW=$(last -n 2 --time-format iso 2>/dev/null | awk '
+  NR==2 && $1!="" && $1!="wtmp" {
+    user=$1; host=$3; dt=$4
+    sub(/T.*/, "", dt)
+    split($5, t, "+"); tm=substr(t[1],1,5)
+    printf "%s  %s  %s %s", user, host, dt, tm
+  }')
+[ -z "$LAST_LOGIN_RAW" ] && LAST_LOGIN_RAW="no prior login found"
+LAST_LOGIN="${LAST_LOGIN_RAW:0:45}"
+
+# ── Collect: Resources ────────────────────────────────────
+# CPU — prefer mpstat (more accurate), fallback to top, then vmstat
+if [ "$HAS_MPSTAT" -eq 1 ]; then
+  CPU_IDLE=$(mpstat 1 1 | awk '/Average/ {print $NF}')
+else
+  CPU_IDLE=$(top -bn1 | grep "Cpu(s)" | awk '{for(i=1;i<=NF;i++) if($i~/id,/) print $(i-1)}' | tr -d '%,')
+  [ -z "$CPU_IDLE" ] && CPU_IDLE=$(vmstat 1 2 | tail -1 | awk '{print $15}')
+fi
+CPU_PCT=$(awk "BEGIN {printf \"%d\", 100 - ${CPU_IDLE:-0}}")
+CPU_FRAC="${CPU_PCT}/100%"
+
+read -r _ MEM_TOTAL_MB MEM_USED_MB _ _ <<< $(free -m | awk '/^Mem:/ {print $1,$2,$3,$6,$7}')
+MEM_PCT=$(( 100 * MEM_USED_MB / MEM_TOTAL_MB ))
+MEM_USED_GB=$(awk "BEGIN {printf \"%.2f\", $MEM_USED_MB/1024}")
+MEM_TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $MEM_TOTAL_MB/1024}")
+MEM_FRAC="${MEM_USED_GB}/${MEM_TOTAL_GB} GB"
+
+# ── Collect: Processes ────────────────────────────────────
+declare -a PROC_NAME PROC_PID PROC_CPU PROC_MEM
+while IFS= read -r line; do
+  p_pid=$(echo "$line" | awk '{print $1}')
+  p_cpu=$(echo "$line" | awk '{print $2}')
+  p_mem=$(echo "$line" | awk '{print $3}')
+  p_cmd=$(basename "$(echo "$line" | awk '{print $4}')" 2>/dev/null)
+  PROC_PID+=("$p_pid"); PROC_CPU+=("$p_cpu")
+  PROC_MEM+=("$p_mem"); PROC_NAME+=("$p_cmd")
+done < <(ps aux --no-headers | awk '{print $2, $3, $4, $11}' | grep -v " ps$\| ps \|sysinfo" | sort -k2 -rn | head -5)
+
+# ── Collect: Storage ──────────────────────────────────────
+declare -A SEEN_DEVS
+declare -a MKEYS MPCT MFRAC
+while read -r dev size used avail usepct mnt; do
+  [[ "$dev" == tmpfs*     ]] && continue
+  [[ "$dev" == devtmpfs*  ]] && continue
+  [[ "$dev" == overlay*   ]] && continue
+  [[ "$dev" == /dev/loop* ]] && continue
+  [[ "$mnt" == /sys*  ]] && continue
+  [[ "$mnt" == /boot*  ]] && continue
+  [[ "$mnt" == /proc* ]] && continue
+  [[ "$mnt" == /dev/shm* || "$mnt" == /dev/pts* ]] && continue
+  [[ "$mnt" == /run*  ]] && continue
+  [[ -n "${SEEN_DEVS[$dev]}" ]] && continue
+  SEEN_DEVS[$dev]=1
+  MKEYS+=("$mnt"); MPCT+=("${usepct/\%/}")
+  MFRAC+=("$(fmt_bytes $(( used * 1024 )))/$(fmt_bytes $(( size * 1024 )))")
+done < <(df -k --output=source,size,used,avail,pcent,target 2>/dev/null | tail -n +2 | sort -k6)
+
+# Function to get serial number from smartctl output
+get_serial_from_smartctl() {
+  local smart_output="$1"
+  echo "$smart_output" | grep -i "Serial Number:" | awk -F: '{print $2}' | xargs
+}
+
+# ── Collect: Drives ───────────────────────────────────────
+declare -a DRV_DEV DRV_MODEL DRV_SIZE DRV_TEMP DRV_STATUS
+
+get_smart_access_for_drive() {
+  local dev="$1"
+  local tran="$2"
+  local jmb_base_dev="${3:-}"
+  local jmb_slot="${4:-0}"
+
+  if [[ "$tran" == "nvme" ]]; then
+    echo "$dev|-d nvme"
+    return
+  fi
+
+  if [[ "$tran" == "usb" ]]; then
+    # QNAP TR-004 / JMicron bridge.
+    # For TR-004, smartctl slot access must be done against the base bridge device.
+    # Example: /dev/sdb with jmb39x-q,0/1/2/3. Display still uses sdb/sdc/sdd/sde.
+    if [[ -n "$jmb_base_dev" ]] && sudo smartctl -i -d "jmb39x-q,$jmb_slot" "$jmb_base_dev" &>/dev/null; then
+      echo "$jmb_base_dev|-d jmb39x-q,$jmb_slot"
+      return
+    fi
+
+    # Generic USB-SATA fallback.
+    if sudo smartctl -i -d sat "$dev" &>/dev/null; then
+      echo "$dev|-d sat"
+      return
+    fi
+  fi
+
+  # Normal SATA/SAS fallback.
+  if sudo smartctl -i -d sat "$dev" &>/dev/null; then
+    echo "$dev|-d sat"
+    return
+  fi
+
+  if sudo smartctl -i "$dev" &>/dev/null; then
+    echo "$dev|"
+    return
+  fi
+
+  echo "$dev|"
+}
+
+get_drive_temperature() {
+  local dev="$1"
+  local args="$2"
+  local output temp
+
+  output=$(sudo smartctl -A $args "$dev" 2>/dev/null)
+
+  temp=$(echo "$output" | awk '
+    /Temperature_Celsius/       {print $10; exit}
+    /Airflow_Temperature_Cel/   {print $10; exit}
+    /^Temperature:/             {print $2; exit}
+    /Current Drive Temperature/ {print $NF; exit}
+  ')
+
+  temp="${temp%%[^0-9]*}"
+
+  if [[ -z "$temp" ]]; then
+    output=$(sudo smartctl -x $args "$dev" 2>/dev/null)
+    temp=$(echo "$output" | awk '/Current Temperature:/ {print $3; exit}')
+    temp="${temp%%[^0-9]*}"
+  fi
+
+  if [[ "$temp" =~ ^[0-9]+$ ]]; then
+    echo "${temp}°C"
+  else
+    echo "n/a"
+  fi
+}
+
+get_drive_health() {
+  local dev="$1"
+  local args="$2"
+  local health bad
+
+  health=$(sudo smartctl -H $args "$dev" 2>/dev/null)
+
+  if echo "$health" | grep -qi "PASSED"; then
+    echo "OK"
+    return
+  fi
+
+  if echo "$health" | grep -qi "FAILED"; then
+    echo "FAILED"
+    return
+  fi
+
+  # Fallback for USB bridges where smartctl -H is limited.
+  bad=$(sudo smartctl -A $args "$dev" 2>/dev/null | awk '
+    /Reallocated_Sector_Ct/   && $10 > 0 {bad=1}
+    /Current_Pending_Sector/  && $10 > 0 {bad=1}
+    /Offline_Uncorrectable/   && $10 > 0 {bad=1}
+    /UDMA_CRC_Error_Count/    && $10 > 0 {crc=1}
+    END {
+      if (bad == 1) print "FAILED";
+      else if (crc == 1) print "WARNING";
+      else print "OK";
+    }
+  ')
+
+  echo "${bad:-UNKNOWN}"
+}
+
+if [ "$HAS_SMARTCTL" -eq 1 ]; then
+  JMB_BASE_DEV=""
+  JMB_SLOT=0
+
+  # If a QNAP TR-004/JMicron bridge is present, the first USB disk acts as the
+  # smartctl bridge base device. Slots are then addressed with jmb39x-q,0..N.
+  while IFS= read -r line; do
+    eval "$line"
+    [[ "$TYPE" != "disk" ]] && continue
+    [[ "$TRAN" != "usb" ]] && continue
+    [[ "$NAME" == loop* || "$NAME" == ram* ]] && continue
+
+    candidate="/dev/$NAME"
+    if sudo smartctl -i -d jmb39x-q,0 "$candidate" &>/dev/null; then
+      JMB_BASE_DEV="$candidate"
+      break
+    fi
+  done < <(lsblk -dn -P -o NAME,MODEL,SIZE,TYPE,TRAN 2>/dev/null)
+
+  while IFS= read -r line; do
+    eval "$line"
+
+    [[ "$TYPE" != "disk" ]] && continue
+    [[ "$NAME" == loop* || "$NAME" == ram* ]] && continue
+
+    dev="/dev/$NAME"
+    jmb_slot_for_drive=""
+
+    if [[ "$TRAN" == "usb" && -n "$JMB_BASE_DEV" ]]; then
+      jmb_slot_for_drive="$JMB_SLOT"
+      JMB_SLOT=$(( JMB_SLOT + 1 ))
+    fi
+
+    access=$(get_smart_access_for_drive "$dev" "$TRAN" "$JMB_BASE_DEV" "${jmb_slot_for_drive:-0}")
+    smart_dev="${access%%|*}"
+    args="${access#*|}"
+
+    drv_model="$MODEL"
+    drv_size="$SIZE"
+    drv_temp="n/a"
+    drv_status="UNKNOWN"
+
+    if [[ -n "$smart_dev" ]]; then
+      smart_info=$(sudo smartctl -i $args "$smart_dev" 2>/dev/null)
+      sm=$(echo "$smart_info" | grep -iE "^(Device Model|Model Number):" | head -1 | awk -F: '{print $2}' | xargs)
+      [ -n "$sm" ] && drv_model="$sm"
+
+      drv_temp=$(get_drive_temperature "$smart_dev" "$args")
+      drv_status=$(get_drive_health "$smart_dev" "$args")
+    fi
+
+    [ -z "$drv_model" ] && drv_model="unknown"
+
+    DRV_DEV+=("$NAME")
+    DRV_MODEL+=("$drv_model")
+    DRV_SIZE+=("$drv_size")
+    DRV_TEMP+=("$drv_temp")
+    DRV_STATUS+=("$drv_status")
+
+  done < <(lsblk -dn -P -o NAME,MODEL,SIZE,TYPE,TRAN 2>/dev/null)
+fi
+
+# ── Collect: RAID ─────────────────────────────────────────
+declare -a RAID_DEV RAID_STATE RAID_DETAIL
+if [ "$HAS_MDADM" -eq 1 ]; then
+  while read -r md; do
+    detail=$(sudo mdadm --detail "/dev/${md}" 2>/dev/null)
+    state=$(echo "$detail"  | awk '/State :/{$1=$2=""; print $0}' | xargs)
+    active=$(echo "$detail" | awk '/Active Devices :/{print $NF}')
+    total=$(echo "$detail"  | awk '/Raid Devices :/{print $NF}')
+    failed=$(echo "$detail" | awk '/Failed Devices :/{print $NF}')
+    [ -z "$state" ] && state="unknown"
+    RAID_DEV+=("$md")
+    RAID_STATE+=("${state} (${active}/${total} active, ${failed} failed)")
+    RAID_DETAIL+=("$state")
+  done < <(ls /sys/block/ | grep '^md')
+fi
+
+# ── Collect: Hardware Health ──────────────────────────────
+# Priority: ipmitool → lm_sensors → none
+declare -a HW_NAME HW_VALUE HW_STATUS HW_TYPE  # type: temp | fan | voltage
+
+# Try ipmitool first; if it yields no results fall through to lm_sensors
+if [ "$HAS_IPMITOOL" -eq 1 ]; then
+  while IFS= read -r line; do
+    name=$(echo   "$line" | awk -F'|' '{print $1}' | xargs)
+    value=$(echo  "$line" | awk -F'|' '{print $2}' | xargs)
+    status=$(echo "$line" | awk -F'|' '{print $3}' | xargs)
+    if [[ "$value" == *degrees* ]]; then
+      temp=$(echo "$value" | grep -oE '[0-9]+')
+      HW_NAME+=("$name"); HW_VALUE+=("${temp}°C"); HW_STATUS+=("$status"); HW_TYPE+=("temp")
+    elif [[ "$value" == *RPM* ]]; then
+      rpm=$(echo "$value" | grep -oE '[0-9]+')
+      HW_NAME+=("$name"); HW_VALUE+=("${rpm} RPM"); HW_STATUS+=("$status"); HW_TYPE+=("fan")
+    fi
+  done < <(sudo ipmitool sdr 2>/dev/null | grep -E 'Temp|FAN|CPU' | grep -v 'no reading')
+fi
+
+# Fall through to lm_sensors if ipmitool yielded nothing
+if [ "${#HW_NAME[@]}" -eq 0 ] && [ "$HAS_SENSORS" -eq 1 ]; then
+  # Track seen labels to avoid true duplicates from multiple chips
+  declare -A _SEEN_SENSOR
+  while IFS= read -r line; do
+    # Skip blank lines and lines without a colon (chip headers like "coretemp-isa-0000")
+    [[ -z "$line" || "$line" != *:* ]] && continue
+    [[ "$line" =~ ^Adapter: ]] && continue
+
+    label=$(echo "$line" | cut -d: -f1 | xargs)
+    [[ -z "$label" ]] && continue
+
+    # Skip individual cores and redundant/noisy labels
+    [[ "$label" =~ ^Core[[:space:]][0-9] ]] && continue
+    [[ "$label" =~ ^(PHY|MAC|PECI|PCH)   ]] && continue
+    [[ "$label" == "Package id 0"         ]] && continue
+
+    # Rename generic tempN labels → friendly names
+    # Use numbered fallback so temp3, temp4 etc still appear
+    case "$label" in
+      temp1) label="System Temp"   ;;
+      temp2) label="CPU Temp"      ;;
+      temp3) label="Aux Temp"      ;;
+      temp4) label="Board Temp"    ;;
+    esac
+
+    raw_val=$(echo "$line" | cut -d: -f2-)
+
+    # Temperature reading
+    if echo "$raw_val" | grep -q '°C'; then
+      temp=$(echo "$raw_val" | grep -oE '[+-]?[0-9]+(\.[0-9]+)?' | head -1 | tr -d '+')
+      [[ -z "$temp" || ! "$temp" =~ ^-?[0-9] ]] && continue
+      # skip bogus below -50
+      awk "BEGIN {exit !($temp < -50)}" && continue
+      # Dedup: if same label seen from another chip, append chip index
+      if [[ -n "${_SEEN_SENSOR[$label]}" ]]; then
+        _SEEN_SENSOR[$label]=$(( ${_SEEN_SENSOR[$label]} + 1 ))
+        label="${label} ${_SEEN_SENSOR[$label]}"
+      else
+        _SEEN_SENSOR[$label]=1
+      fi
+      HW_NAME+=("$label"); HW_VALUE+=("${temp}°C"); HW_STATUS+=("ok"); HW_TYPE+=("temp")
+
+    # Fan reading
+    elif echo "$raw_val" | grep -q 'RPM'; then
+      rpm=$(echo "$raw_val" | grep -oE '[0-9]+' | head -1)
+      [ -z "$rpm" ] && continue
+      if [[ -n "${_SEEN_SENSOR[$label]}" ]]; then
+        _SEEN_SENSOR[$label]=$(( ${_SEEN_SENSOR[$label]} + 1 ))
+        label="${label} ${_SEEN_SENSOR[$label]}"
+      else
+        _SEEN_SENSOR[$label]=1
+      fi
+      HW_NAME+=("$label"); HW_VALUE+=("${rpm} RPM"); HW_STATUS+=("ok"); HW_TYPE+=("fan")
+    fi
+  done < <(sensors 2>/dev/null)
+fi
+
+# ── Render ────────────────────────────────────────────────
+echo ""
+top_line
+title_row "  SYSTEM OVERVIEW"
+
+section "Identity"
+kv_row "Host"    "$(whoami)@$(hostname)"
+kv_row "OS"      "$OS_NAME"
+# CPU model — truncate to fit VL
+# Truncate CPU model to fit, keeping "(X cores)" suffix intact
+_cores_suffix=" (${CPU_CORES} cores)"
+_model_max=$(( VL - ${#_cores_suffix} - 1 ))
+if [ "${#CPU_MODEL}" -gt "$_model_max" ]; then
+  cpu_display="${CPU_MODEL:0:$(( _model_max - 1 ))}~${_cores_suffix}"
+else
+  cpu_display="${CPU_MODEL}${_cores_suffix}"
+fi
+kv_row "CPU" "$cpu_display"
+for _i in "${!LOCAL_IPS[@]}"; do
+  if [ "$_i" -eq 0 ]; then kv_row "Local IPs" "${LOCAL_IPS[$_i]}" "$CYAN" "$GREEN"
+  else                       kv_row ""          "${LOCAL_IPS[$_i]}" "$CYAN" "$GREEN"
+  fi
+done
+kv_row "Public IP"  "$PUBLIC_IP"   "$CYAN" "$MAGENTA"
+kv_row "Uptime"     "$UPTIME_STR"  "$CYAN" "$UPTIME_COLOR"
+kv_row "Last Login" "$LAST_LOGIN"  "$CYAN" "$DIM"
+
+section "System Resources"
+res_row "CPU"    "$CPU_PCT" "$CPU_FRAC"
+res_row "Memory" "$MEM_PCT" "$MEM_FRAC"
+
+section "Top 5 CPU Processes"
+for i in "${!PROC_NAME[@]}"; do
+  proc_row "${PROC_NAME[$i]}" "${PROC_PID[$i]}" "${PROC_CPU[$i]}" "${PROC_MEM[$i]}"
+done
+
+section "Storage"
+if [ "${#MKEYS[@]}" -eq 0 ]; then
+  kv_row "No mounts found" "" "$RED"
+else
+  for i in "${!MKEYS[@]}"; do
+    res_row "${MKEYS[$i]}" "${MPCT[$i]}" "${MFRAC[$i]}"
+  done
+fi
+
+section "Drives"
+if [ "${#DRV_DEV[@]}" -eq 0 ]; then
+  kv_row "No drives found" "" "$RED"
+else
+  drive_header
+  for i in "${!DRV_DEV[@]}"; do
+    drive_row "${DRV_DEV[$i]}" "${DRV_MODEL[$i]}" "${DRV_SIZE[$i]}" "${DRV_TEMP[$i]}" "${DRV_STATUS[$i]}"
+  done
+  [ "$HAS_SMARTCTL" -eq 0 ] && kv_row "⚠ install smartctl" "dnf install smartmontools" "$YELLOW" "$DIM"
+fi
+
+if [ "${#RAID_DEV[@]}" -gt 0 ]; then
+  section "RAID Health"
+  for i in "${!RAID_DEV[@]}"; do
+    case "${RAID_DETAIL[$i]}" in
+      clean|active)          sc="$GREEN"  ;;
+      degraded*|recovering*) sc="$YELLOW" ;;
+      *)                     sc="$RED"    ;;
+    esac
+    kv_row "/dev/${RAID_DEV[$i]}" "${RAID_STATE[$i]}" "$CYAN" "$sc"
+  done
+fi
+
+if [ "${#HW_NAME[@]}" -gt 0 ]; then
+  section "Hardware Health"
+  for i in "${!HW_NAME[@]}"; do
+    case "${HW_TYPE[$i]}" in
+      temp)
+        temp_num=$(echo "${HW_VALUE[$i]}" | grep -oE '^[0-9]+')
+        tint=${temp_num:-0}
+        # Override status based on actual temperature value
+        if   [ "$tint" -ge 90 ]; then _tstatus="CRITICAL"; _tcolor="$RED"
+        elif [ "$tint" -ge 75 ]; then _tstatus="WARNING";  _tcolor="$YELLOW"
+        else                          _tstatus="ok";        _tcolor="$GREEN"
+        fi
+        hw_row "${HW_NAME[$i]}" "${HW_VALUE[$i]}" "$_tstatus" "$_tcolor" "temp"
+        ;;
+      fan)
+        hw_row "${HW_NAME[$i]}" "${HW_VALUE[$i]}" "${HW_STATUS[$i]}" "$BLUE" "fan"
+        ;;
+    esac
+  done
+elif [ "$HAS_IPMITOOL" -eq 0 ] && [ "$HAS_SENSORS" -eq 0 ]; then
+  section "Hardware Health"
+  kv_row "⚠ no sensor tool" "install ipmitool or lm_sensors" "$YELLOW" "$DIM"
+fi
+
+bottom_line
+echo ""
