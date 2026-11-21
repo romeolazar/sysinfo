@@ -5,6 +5,9 @@
 #  Auto-detects: ipmitool, lm_sensors, mpstat, mdadm, smartctl
 # ══════════════════════════════════════════════════════════
 
+# sbin dirs hold smartctl, mdadm etc.; missing from PATH in ssh/cron sessions
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+
 # ── Colors ────────────────────────────────────────────────
 RED="\e[38;5;203m"
 GREEN="\e[38;5;114m"
@@ -20,6 +23,12 @@ TL="╭"; TR="╮"; BL="╰"; BR="╯"; H="─"; V="│"; ML="├"; MR="┤"
 
 # ── Layout ────────────────────────────────────────────────
 W=70; K=18; VL=$(( W - K - 7 )); INNER=$(( W - 2 ))
+
+# Mount points hidden from Storage (shell glob patterns)
+STORAGE_SKIP_MOUNTS=("/mnt/@remote*" "/mnt/factory" "/rootfs*" "/overlay" "/ugreen")
+
+# Block devices hidden from Drives (shell glob patterns)
+DRIVES_SKIP=("loop*" "ram*" "zram*" "mmcblk*boot*")
 
 # ── Primitives ────────────────────────────────────────────
 rep() { local i; for ((i=0; i<$2; i++)); do printf "%s" "$1"; done; }
@@ -78,6 +87,25 @@ _row() {
 }
 kv_row() { _row "$1" "$2" "${3:-$CYAN}" "${4:-$RESET}"; }
 
+# member_row KEY DOT_COLOR TEXT TEXT_COLOR — bond member: "▪ text"
+member_row() {
+  local key="$1" dc="$2" text="$3" tc="$4"
+  local kpad=$(( K  - ${#key} ));      [ "$kpad" -lt 0 ] && kpad=0
+  local vpad=$(( VL - 2 - ${#text} )); [ "$vpad" -lt 0 ] && vpad=0
+  printf "${DIM}${V}${RESET} ${CYAN}${BOLD}%s${RESET}" "$key"; rep " " "$kpad"
+  printf " ${DIM}${V}${RESET} ${dc}▪${RESET} ${tc}%s${RESET}" "$text"; rep " " "$vpad"
+  printf " ${DIM}${V}${RESET}\n"
+}
+
+# fmt_speed MBPS — 100 -> 100M, 1000 -> 1G, 2500 -> 2.5G, 10000 -> 10G (empty if unknown)
+fmt_speed() {
+  local s="$1"
+  [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -gt 0 ] || return 0
+  if [ "$s" -ge 1000 ]; then awk -v s="$s" 'BEGIN {printf "%gG", s/1000}'
+  else printf "%dM" "$s"
+  fi
+}
+
 # dot_meter FILL EMPTY — prints exactly FILL+EMPTY visible chars, no string stored
 dot_meter() {
   local fill=$1 empty=$2 c=$3
@@ -116,6 +144,7 @@ res_row() {
   local frac_w=$(( VL - fixed ))
   [ "$frac_w" -lt 0 ] && frac_w=0
 
+  [ "${#key}" -gt "$K" ] && key="${key:0:$(( K - 1 ))}~"
   local kpad=$(( K - ${#key} )); [ "$kpad" -lt 0 ] && kpad=0
 
   printf "${DIM}${V}${RESET} ${CYAN}${BOLD}%s${RESET}" "$key"
@@ -268,12 +297,52 @@ OS_NAME=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')
 CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2- | xargs)
 CPU_CORES=$(nproc)
 
+# ── Collect: Network bonds ────────────────────────────────
+# Per bond: mode, active member ("*" = all up members, e.g. 802.3ad), members (name|mii)
+BONDING_DIR="${BONDING_DIR:-/proc/net/bonding}"
+declare -a BOND_NAMES
+declare -A BOND_MODE BOND_ACTIVE BOND_MEMBERS BOND_SPEED
+for _f in "$BONDING_DIR"/*; do
+  [ -r "$_f" ] || continue
+  _b="${_f##*/}"
+  BOND_NAMES+=("$_b"); BOND_ACTIVE[$_b]="*"; BOND_MEMBERS[$_b]=""
+  while IFS='|' read -r _tag _a _c; do
+    case "$_tag" in
+      MODE)   BOND_MODE[$_b]="$_a" ;;
+      ACTIVE) BOND_ACTIVE[$_b]="$_a" ;;
+      SLAVE)  BOND_MEMBERS[$_b]+="${_a}|${_c} " ;;
+    esac
+  done < <(awk '
+    /^Bonding Mode:/            { sub(/^Bonding Mode: /, ""); m=$0
+                                  if (match(m, /\([^)]*\)/)) m=substr(m, RSTART+1, RLENGTH-2)
+                                  else if (m ~ /802\.3ad/) m="802.3ad"
+                                  print "MODE|" m "|" }
+    /^Currently Active Slave:/  { sub(/^[^:]*: /, ""); print "ACTIVE|" $0 "|" }
+    /^Slave Interface:/         { s=$3 }
+    /^MII Status:/ && s != ""   { print "SLAVE|" s "|" $3; s="" }
+  ' "$_f")
+  [ "${BOND_ACTIVE[$_b]}" = "None" ] && BOND_ACTIVE[$_b]=""
+  # Bond speed: active-backup → speed of the active member; otherwise the bond itself
+  if [ -n "${BOND_ACTIVE[$_b]}" ] && [ "${BOND_ACTIVE[$_b]}" != "*" ]; then
+    BOND_SPEED[$_b]=$(fmt_speed "$(cat "/sys/class/net/${BOND_ACTIVE[$_b]}/speed" 2>/dev/null)")
+  else
+    BOND_SPEED[$_b]=$(fmt_speed "$(cat "/sys/class/net/${_b}/speed" 2>/dev/null)")
+  fi
+done
+
 LOCAL_IPS=()
 while read -r iface addr; do
   [[ "$iface" =~ ^(lo|docker|br-|veth|virbr|tun|tap|dummy|ovs|flannel|cali|weave|cilium|wg|utun) ]] && continue
   [[ "$iface" =~ \.[0-9]+$ ]] && continue
   [[ "$(cat /sys/class/net/${iface}/operstate 2>/dev/null)" == "down" ]] && continue
-  LOCAL_IPS+=("${addr}(${iface})")
+  if [[ -n "${BOND_MEMBERS[$iface]+x}" ]]; then
+    _spd="${BOND_SPEED[$iface]}"
+  else
+    _spd=$(fmt_speed "$(cat "/sys/class/net/${iface}/speed" 2>/dev/null)")
+  fi
+  if [ -n "$_spd" ]; then LOCAL_IPS+=("${addr}(${iface}, ${_spd})")
+  else                    LOCAL_IPS+=("${addr}(${iface})")
+  fi
 done < <(ip -4 addr show | awk '/^[0-9]+:/{iface=$2; gsub(/:$/,"",iface)} /inet /{print iface, $2}' | awk -F'/' '{print $1}')
 
 PUBLIC_IP=$(curl -s --max-time 4 ifconfig.me 2>/dev/null || echo "n/a")
@@ -284,6 +353,41 @@ UPTIME_DAYS=$(( UPTIME_SECS / 86400 ))
 if   [ "$UPTIME_DAYS" -ge 90 ]; then UPTIME_COLOR="$RED"
 elif [ "$UPTIME_DAYS" -ge 30 ]; then UPTIME_COLOR="$YELLOW"
 else                                  UPTIME_COLOR="$GREEN"
+fi
+
+# Last Updates — date of the last dnf transaction that upgraded packages
+LAST_UPD=""; LAST_UPD_COLOR="$DIM"
+_upd_date=""
+if command -v dnf &>/dev/null; then
+  # RHEL / Rocky / Fedora
+  _upd_date=$(dnf history list 2>/dev/null | awk -F'|' 'NR>2 && $4 ~ /U/ {gsub(/^ +| +$/, "", $3); print $3; exit}')
+elif [ -d /var/log/apt ]; then
+  # Debian / Ubuntu — newest log first (history.log, then rotated history.log.N.gz)
+  for _lf in /var/log/apt/history.log $(ls -v /var/log/apt/history.log.*.gz 2>/dev/null); do
+    [ -r "$_lf" ] || continue
+    _upd_date=$(zcat -f "$_lf" 2>/dev/null | awk '
+      /^Start-Date:/ {u=0}
+      /^Upgrade:/    {u=1}
+      /^End-Date:/ && u {d=$2 " " substr($3,1,5)}
+      END {print d}')
+    [ -n "$_upd_date" ] && break
+  done
+fi
+if [ -n "$_upd_date" ]; then
+  _upd_secs=$(date -d "$_upd_date" +%s 2>/dev/null)
+  if [ -n "$_upd_secs" ]; then
+    _age=$(( $(date +%s) - _upd_secs )); [ "$_age" -lt 0 ] && _age=0
+    if   [ "$_age" -lt 3600  ]; then _ago="$(( _age / 60 ))m ago"
+    elif [ "$_age" -lt 86400 ]; then _ago="$(( _age / 3600 ))h ago"
+    else                             _ago="$(( _age / 86400 ))d ago"
+    fi
+    LAST_UPD="${_upd_date} (${_ago})"
+    _age_days=$(( _age / 86400 ))
+    if   [ "$_age_days" -ge 60 ]; then LAST_UPD_COLOR="$RED"
+    elif [ "$_age_days" -ge 30 ]; then LAST_UPD_COLOR="$YELLOW"
+    else                               LAST_UPD_COLOR="$GREEN"
+    fi
+  fi
 fi
 
 LAST_LOGIN_RAW=$(last -n 2 --time-format iso 2>/dev/null | awk '
@@ -337,11 +441,22 @@ while read -r dev size used avail usepct mnt; do
   [[ "$mnt" == /proc* ]] && continue
   [[ "$mnt" == /dev/shm* || "$mnt" == /dev/pts* ]] && continue
   [[ "$mnt" == /run*  ]] && continue
+  [[ "$mnt" == "/dev" ]] && continue
+  # Hide remote/system mounts (NAS firmware partitions, cloud/CIFS mounts)
+  for _skip in "${STORAGE_SKIP_MOUNTS[@]}"; do
+    [[ "$mnt" == $_skip ]] && continue 2
+  done
   [[ -n "${SEEN_DEVS[$dev]}" ]] && continue
   SEEN_DEVS[$dev]=1
   MKEYS+=("$mnt"); MPCT+=("${usepct/\%/}")
   MFRAC+=("$(fmt_bytes $(( used * 1024 )))/$(fmt_bytes $(( size * 1024 )))")
-done < <(df -k --output=source,size,used,avail,pcent,target 2>/dev/null | tail -n +2 | sort -k6)
+done < <(
+  # A dead network mount can make df hang: limit it, then retry with local filesystems only
+  _df_run() { if command -v timeout &>/dev/null; then timeout 5 df "$@"; else df "$@"; fi; }
+  _df_out=$(_df_run -k --output=source,size,used,avail,pcent,target 2>/dev/null)
+  [ -z "$_df_out" ] && _df_out=$(_df_run -k -l --output=source,size,used,avail,pcent,target 2>/dev/null)
+  printf '%s\n' "$_df_out" | tail -n +2 | sort -k6
+)
 
 # Function to get serial number from smartctl output
 get_serial_from_smartctl() {
@@ -478,7 +593,9 @@ if [ "$HAS_SMARTCTL" -eq 1 ]; then
     eval "$line"
 
     [[ "$TYPE" != "disk" ]] && continue
-    [[ "$NAME" == loop* || "$NAME" == ram* ]] && continue
+    _skipd=0
+    for _p in "${DRIVES_SKIP[@]}"; do [[ "$NAME" == $_p ]] && _skipd=1; done
+    [ "$_skipd" -eq 1 ] && continue
 
     dev="/dev/$NAME"
     jmb_slot_for_drive=""
@@ -506,6 +623,15 @@ if [ "$HAS_SMARTCTL" -eq 1 ]; then
       drv_status=$(get_drive_health "$smart_dev" "$args")
     fi
 
+    # No model reported: label eMMC / SD cards from the kernel's device type
+    if [ -z "$drv_model" ] || [ "$drv_model" = "unknown" ]; then
+      if [[ "$NAME" == mmcblk* ]]; then
+        case "$(cat "/sys/block/${NAME}/device/type" 2>/dev/null)" in
+          MMC) drv_model="eMMC" ;;
+          SD)  drv_model="SD card" ;;
+        esac
+      fi
+    fi
     [ -z "$drv_model" ] && drv_model="unknown"
 
     DRV_DEV+=("$NAME")
@@ -531,6 +657,50 @@ if [ "$HAS_MDADM" -eq 1 ]; then
     RAID_STATE+=("${state} (${active}/${total} active, ${failed} failed)")
     RAID_DETAIL+=("$state")
   done < <(ls /sys/block/ | grep '^md')
+fi
+
+# ── Collect: RAM modules (dmidecode needs root) ───────────
+# Runs after the drives section so a cached sudo password is reused (sudo -n never prompts)
+RAM_LINES=()
+RAM_NOTE=""
+if command -v dmidecode &>/dev/null; then
+  if [ "$EUID" -eq 0 ]; then _dmi=$(dmidecode -t 17 2>/dev/null)
+  else                       _dmi=$(sudo -n dmidecode -t 17 2>/dev/null)
+  fi
+  if [ -n "$_dmi" ]; then
+    while IFS='|' read -r _cnt _sz _mf _pn _sp; do
+      [ -z "$_sz" ] && continue
+      _name="$_mf $_pn"; _name=$(echo "$_name" | xargs)
+      _txt=""
+      [ "$_cnt" -gt 1 ] && _txt="${_cnt}x "
+      if [ -n "$_name" ]; then _txt="${_txt}${_name}, ${_sz}"; else _txt="${_txt}${_sz}"; fi
+      [ -n "$_sp" ] && _txt="${_txt}, ${_sp}"
+      [ "${#_txt}" -gt "$VL" ] && _txt="${_txt:0:$(( VL - 1 ))}~"
+      RAM_LINES+=("$_txt")
+    done < <(printf '%s\n' "$_dmi" | awk '
+      function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+      function emit(   sz, n, spd) {
+        if (!have || sz_raw == "" || sz_raw ~ /No Module/ || sz_raw ~ /Not Installed/) return
+        n = split(sz_raw, a, " ")
+        if (a[2] == "MB") sz = (a[1] / 1024) " GB"
+        else { sz = a[1] " GB" }
+        if (mf ~ /^[0-9A-Fa-f]{4}$/ || mf ~ /Unknown|Not Specified|^0+$/) mf = ""
+        if (pn ~ /Unknown|Not Specified|^0+$/) pn = ""
+        spd = (cs != "" && cs !~ /Unknown/) ? cs : sp
+        n = split(spd, b, " "); spd = (b[1] ~ /^[0-9]+$/) ? b[1] " MHz" : ""
+        print sz "|" mf "|" pn "|" spd
+      }
+      /^Memory Device/ { emit(); have=1; sz_raw=""; mf=""; pn=""; sp=""; cs="" }
+      /^[ \t]*Size:/                    { sz_raw=trim(substr($0, index($0, ":")+1)) }
+      /^[ \t]*Manufacturer:/            { mf=trim(substr($0, index($0, ":")+1)) }
+      /^[ \t]*Part Number:/             { pn=trim(substr($0, index($0, ":")+1)) }
+      /^[ \t]*Speed:/                   { sp=trim(substr($0, index($0, ":")+1)) }
+      /^[ \t]*Configured Memory Speed:/ { cs=trim(substr($0, index($0, ":")+1)) }
+      END { emit() }
+    ' | sort | uniq -c | awk '{c=$1; $1=""; sub(/^ /,""); print c "|" $0}')
+  else
+    RAM_NOTE="n/a (dmidecode needs sudo)"
+  fi
 fi
 
 # ── Collect: Hardware Health ──────────────────────────────
@@ -611,6 +781,28 @@ if [ "${#HW_NAME[@]}" -eq 0 ] && [ "$HAS_SENSORS" -eq 1 ]; then
   done < <(sensors 2>/dev/null)
 fi
 
+# Last resort: kernel thermal zones (no sensor tool needed)
+if [ "${#HW_NAME[@]}" -eq 0 ]; then
+  declare -A _SEEN_TZ
+  for _tz in /sys/class/thermal/thermal_zone*; do
+    [ -r "$_tz/temp" ] || continue
+    _tztype=$(cat "$_tz/type" 2>/dev/null)
+    case "$_tztype" in
+      x86_pkg_temp|cpu-thermal|cpu_thermal|soc_thermal|k10temp|coretemp) _tzlabel="CPU Temp" ;;
+      acpitz)                                                            _tzlabel="SYS Temp" ;;
+      *) continue ;;
+    esac
+    [ -n "${_SEEN_TZ[$_tzlabel]}" ] && continue
+    _tzraw=$(cat "$_tz/temp" 2>/dev/null)
+    [[ "$_tzraw" =~ ^[0-9]+$ ]] || continue
+    [ "$_tzraw" -le 0 ] || [ "$_tzraw" -gt 150000 ] && continue
+    _SEEN_TZ[$_tzlabel]=1
+    HW_NAME+=("$_tzlabel")
+    HW_VALUE+=("$(awk -v t="$_tzraw" 'BEGIN {printf "%.1f", t/1000}')°C")
+    HW_STATUS+=("ok"); HW_TYPE+=("temp")
+  done
+fi
+
 # ── Render ────────────────────────────────────────────────
 echo ""
 top_line
@@ -629,14 +821,64 @@ else
   cpu_display="${CPU_MODEL}${_cores_suffix}"
 fi
 kv_row "CPU" "$cpu_display"
+if [ "${#RAM_LINES[@]}" -gt 0 ]; then
+  for _i in "${!RAM_LINES[@]}"; do
+    if [ "$_i" -eq 0 ]; then kv_row "RAM" "${RAM_LINES[$_i]}"
+    else                       kv_row ""    "${RAM_LINES[$_i]}"
+    fi
+  done
+elif [ -n "$RAM_NOTE" ]; then
+  kv_row "RAM" "$RAM_NOTE" "$CYAN" "$DIM"
+fi
+kv_row "Uptime"     "$UPTIME_STR"  "$CYAN" "$UPTIME_COLOR"
+[ -n "$LAST_UPD" ] && kv_row "Last Updates" "$LAST_UPD" "$CYAN" "$LAST_UPD_COLOR"
+kv_row "Last Login" "$LAST_LOGIN"  "$CYAN" "$DIM"
+
+section "Network"
+kv_row "Public IP"  "$PUBLIC_IP"   "$CYAN" "$MAGENTA"
 for _i in "${!LOCAL_IPS[@]}"; do
   if [ "$_i" -eq 0 ]; then kv_row "Local IPs" "${LOCAL_IPS[$_i]}" "$CYAN" "$GREEN"
   else                       kv_row ""          "${LOCAL_IPS[$_i]}" "$CYAN" "$GREEN"
   fi
 done
-kv_row "Public IP"  "$PUBLIC_IP"   "$CYAN" "$MAGENTA"
-kv_row "Uptime"     "$UPTIME_STR"  "$CYAN" "$UPTIME_COLOR"
-kv_row "Last Login" "$LAST_LOGIN"  "$CYAN" "$DIM"
+
+if [ "${#BOND_NAMES[@]}" -gt 0 ]; then
+  for _b in "${BOND_NAMES[@]}"; do
+    _active="${BOND_ACTIVE[$_b]}"
+    _up=0
+    for _m in ${BOND_MEMBERS[$_b]}; do [ "${_m#*|}" = "up" ] && _up=$(( _up + 1 )); done
+    _bip=$(ip -4 -o addr show dev "$_b" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+
+    if [ "$_up" -eq 0 ] || [ -z "$_active" ]; then
+      kv_row "$_b" "DOWN, no active slave" "$CYAN" "$RED"
+    else
+      _info="${BOND_MODE[$_b]}"
+      [ -n "$_bip" ] && _info="${_info}, ${_bip}"
+      [ -n "${BOND_SPEED[$_b]}" ] && _info="${_info}, ${BOND_SPEED[$_b]}"
+      kv_row "$_b" "$_info" "$CYAN" "$GREEN"
+    fi
+
+    # Pass 1 lists active members first, pass 2 the rest (standby / no link)
+    for _pass in 1 2; do
+      for _m in ${BOND_MEMBERS[$_b]}; do
+        _name="${_m%%|*}"; _mii="${_m#*|}"
+        _is_active=0
+        [ "$_mii" = "up" ] && { [ "$_active" = "*" ] || [ "$_active" = "$_name" ]; } && _is_active=1
+        [ "$_pass" -eq 1 ] && [ "$_is_active" -eq 0 ] && continue
+        [ "$_pass" -eq 2 ] && [ "$_is_active" -eq 1 ] && continue
+        _mspd=$(fmt_speed "$(cat "/sys/class/net/${_name}/speed" 2>/dev/null)")
+        [ -z "$_mspd" ] && _mspd="n/a"
+        if [ "$_mii" != "up" ]; then
+          member_row "$_name" "$RED" "no link" "$RED"
+        elif [ "$_is_active" -eq 1 ]; then
+          member_row "$_name" "$GREEN" "$(printf '%-6s active' "$_mspd")" "$GREEN"
+        else
+          member_row "$_name" "$DIM" "$(printf '%-6s standby' "$_mspd")" "$DIM"
+        fi
+      done
+    done
+  done
+fi
 
 section "System Resources"
 res_row "CPU"    "$CPU_PCT" "$CPU_FRAC"
@@ -681,7 +923,13 @@ fi
 
 if [ "${#HW_NAME[@]}" -gt 0 ]; then
   section "Hardware Health"
-  for i in "${!HW_NAME[@]}"; do
+  # CPU Temp first, then the rest in original order
+  _hw_order=()
+  for i in "${!HW_NAME[@]}"; do [ "${HW_NAME[$i]}" = "CPU Temp" ] && _hw_order+=("$i"); done
+  for i in "${!HW_NAME[@]}"; do [ "${HW_NAME[$i]}" != "CPU Temp" ] && _hw_order+=("$i"); done
+  for i in "${_hw_order[@]}"; do
+    _hw_label="${HW_NAME[$i]}"
+    [ "$_hw_label" = "System Temp" ] && _hw_label="SYS Temp"
     case "${HW_TYPE[$i]}" in
       temp)
         temp_num=$(echo "${HW_VALUE[$i]}" | grep -oE '^[0-9]+')
@@ -691,10 +939,10 @@ if [ "${#HW_NAME[@]}" -gt 0 ]; then
         elif [ "$tint" -ge 75 ]; then _tstatus="WARNING";  _tcolor="$YELLOW"
         else                          _tstatus="ok";        _tcolor="$GREEN"
         fi
-        hw_row "${HW_NAME[$i]}" "${HW_VALUE[$i]}" "$_tstatus" "$_tcolor" "temp"
+        hw_row "$_hw_label" "${HW_VALUE[$i]}" "$_tstatus" "$_tcolor" "temp"
         ;;
       fan)
-        hw_row "${HW_NAME[$i]}" "${HW_VALUE[$i]}" "${HW_STATUS[$i]}" "$BLUE" "fan"
+        hw_row "$_hw_label" "${HW_VALUE[$i]}" "${HW_STATUS[$i]}" "$BLUE" "fan"
         ;;
     esac
   done
